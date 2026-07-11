@@ -1,4 +1,8 @@
 """
+This is something I would like to import in scripts and (hopefull) notebooks
+implementing the ColPali late-interaction similarity map visualizations on real
+vidore_v3_industrial pages ( and more generally, any corpus with qrels and queries).
+
 Core mechanism: ColPali late-interaction similarity maps on real
 vidore_v3_industrial pages.
 
@@ -42,6 +46,71 @@ def load_model() -> tuple[ColPali, ColPaliProcessor]:
 
     processor = cast(ColPaliProcessor, ColPaliProcessor.from_pretrained(MODEL_NAME))
     return model, processor
+
+
+DIAGRAM_CONTENT_TYPES = {"Infographic", "Chart"}
+
+
+def select_training_doc_ids(n_docs: int = 1) -> list[str]:
+    """
+    Rank doc_ids by how many qrels rows point at diagram-like content
+    (Infographic/Chart, per qrels' content_type field) and return the top n_docs.
+
+    This automates the manual "which doc looks diagram-heavy" step: a page's
+    diagram-density is measured by how often real queries were annotated as
+    needing an Infographic/Chart on that page, not just page-count.
+    """
+    corpus_id_to_doc_id = {row["corpus_id"]: row["doc_id"] for row in corpus}
+
+    diagram_counts: dict[str, int] = {}
+    for row in qrels:
+        content_types = row["content_type"] or []
+        if not DIAGRAM_CONTENT_TYPES.intersection(content_types):
+            continue
+        doc_id = corpus_id_to_doc_id.get(row["corpus_id"])
+        if doc_id is None:
+            continue
+        diagram_counts[doc_id] = diagram_counts.get(doc_id, 0) + 1
+
+    ranked = sorted(diagram_counts.items(), key=lambda kv: kv[1], reverse=True)
+    return [doc_id for doc_id, _count in ranked[:n_docs]]
+
+
+def build_train_slice(doc_ids: list[str], max_queries: int = 50, seed: int = 42) -> dict:
+    """
+    Build a small training slice: corpus pages restricted to doc_ids, and the
+    queries whose qrels point at those pages (shuffled, then capped at max_queries).
+
+    Full corpus/queries/qrels stay untouched for eval later — this only
+    returns filtered views for training.
+    """
+    train_corpus = corpus.filter(lambda x: x["doc_id"] in doc_ids)
+    train_corpus_ids = set(train_corpus["corpus_id"])
+
+    train_qrel_ids = set(
+        qrels.filter(lambda x: x["corpus_id"] in train_corpus_ids)["query_id"]
+    )
+    train_queries = queries.filter(lambda x: x["query_id"] in train_qrel_ids)
+    train_queries = train_queries.shuffle(seed=seed)
+
+    if len(train_queries) > max_queries:
+        train_queries = train_queries.select(range(max_queries))
+
+    print(f"Train slice: {len(train_corpus)} pages, {len(train_queries)} queries")
+    return {"corpus": train_corpus, "queries": train_queries}
+
+
+def preview_train_slice(doc_ids: list[str], out_dir: Path, n_preview: int = 8) -> None:
+    """Save a handful of page images from the training doc(s) to out_dir for eyeballing."""
+    train_corpus = corpus.filter(lambda x: x["doc_id"] in doc_ids)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    step = max(1, len(train_corpus) // n_preview)
+    for i in range(0, len(train_corpus), step):
+        row = train_corpus[i]
+        savepath = out_dir / f"preview_{row['doc_id']}_p{row['page_number_in_doc']}.png"
+        row["image"].save(savepath)
+        print(f"Saved: {savepath}")
 
 
 def query_for_corpus_id(corpus_id: int) -> Optional[str]:
