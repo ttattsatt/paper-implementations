@@ -12,6 +12,9 @@ and saves per-token similarity maps (MaxSim visualized as a heatmap).
 
 from pathlib import Path
 from typing import Optional, cast
+from colpali_engine.data.dataset import ColPaliEngineDataset
+
+
 
 import torch
 from colpali_engine.interpretability import (
@@ -22,6 +25,8 @@ from colpali_engine.models import ColPali, ColPaliProcessor
 from colpali_engine.utils.torch_utils import get_torch_device
 from datasets import load_dataset
 from PIL import Image
+from colpali_engine.data.dataset import ColPaliEngineDataset
+
 
 MODEL_NAME = "vidore/colpali-v1.2"
 
@@ -76,29 +81,52 @@ def select_training_doc_ids(n_docs: int = 1) -> list[str]:
     return [doc_id for doc_id, _count in ranked[:n_docs]]
 
 
-def build_train_slice(doc_ids: list[str], max_queries: int = 50, seed: int = 42) -> dict:
+def build_train_slice(doc_ids: list[str], max_queries: int = 50, n_eval: int = 5, seed: int = 42) -> dict:
     """
-    Build a small training slice: corpus pages restricted to doc_ids, and the
-    queries whose qrels point at those pages (shuffled, then capped at max_queries).
+    Build a small training/eval slice: corpus pages restricted to doc_ids,
+    English-only queries whose qrels point at those pages (shuffled, capped
+    at max_queries), each query tagged with its single positive corpus_id
+    (highest qrels score if multiple relevant pages exist), then split into
+    train/eval.
 
-    Full corpus/queries/qrels stay untouched for eval later — this only
-    returns filtered views for training.
+    Full corpus/queries/qrels stay untouched for Phase 5 eval — this only
+    returns filtered, flattened views for training.
     """
     train_corpus = corpus.filter(lambda x: x["doc_id"] in doc_ids)
     train_corpus_ids = set(train_corpus["corpus_id"])
 
-    train_qrel_ids = set(
-        qrels.filter(lambda x: x["corpus_id"] in train_corpus_ids)["query_id"]
+    relevant_qrels = qrels.filter(lambda x: x["corpus_id"] in train_corpus_ids)
+
+    best_positive: dict[str, tuple[int, int]] = {}
+    for row in relevant_qrels:
+        qid, cid, score = row["query_id"], row["corpus_id"], row["score"]
+        if qid not in best_positive or score > best_positive[qid][0]:
+            best_positive[qid] = (score, cid)
+
+    train_qrel_ids = set(best_positive.keys())
+    train_queries = queries.filter(
+        lambda x: x["query_id"] in train_qrel_ids and x["language"] == "english"
     )
-    train_queries = queries.filter(lambda x: x["query_id"] in train_qrel_ids)
     train_queries = train_queries.shuffle(seed=seed)
 
     if len(train_queries) > max_queries:
         train_queries = train_queries.select(range(max_queries))
 
-    print(f"Train slice: {len(train_corpus)} pages, {len(train_queries)} queries")
-    return {"corpus": train_corpus, "queries": train_queries}
+    train_queries = train_queries.map(
+        lambda x: {"positive_corpus_id": best_positive[x["query_id"]][1]}
+    )
 
+    n_eval = min(n_eval, len(train_queries) - 1) if len(train_queries) > n_eval else 0
+    if n_eval > 0:
+        eval_queries = train_queries.select(range(len(train_queries) - n_eval, len(train_queries)))
+        train_queries = train_queries.select(range(len(train_queries) - n_eval))
+    else:
+        eval_queries = None
+
+    print(f"Train slice: {len(train_corpus)} pages, {len(train_queries)} train queries"
+          + (f", {len(eval_queries)} eval queries" if eval_queries else ", no eval split"))
+
+    return {"corpus": train_corpus, "queries": train_queries, "eval_queries": eval_queries}
 
 def preview_train_slice(doc_ids: list[str], out_dir: Path, n_preview: int = 8) -> None:
     """Save a handful of page images from the training doc(s) to out_dir for eyeballing."""
@@ -198,3 +226,31 @@ if __name__ == "__main__":
             out_dir=Path("figures"),
             tag=str(corpus_id),
         )
+
+
+def build_colpali_train_dataset(train_slice: dict) -> ColPaliEngineDataset:
+    """
+    Flatten {corpus, queries} into one row-per-query dataset with the
+    query's single ground-truth positive page image attached directly,
+    matching ColPaliEngineDataset(dataset, pos_target_column_name="image").
+    """
+    corpus_by_id = {row["corpus_id"]: row["image"] for row in train_slice["corpus"]}
+
+    def attach_image(example):
+        return {"image": corpus_by_id[example["positive_corpus_id"]]}
+
+    flat = train_slice["queries"].map(attach_image)
+    return ColPaliEngineDataset(flat, pos_target_column_name="image")
+
+def load_colpali_train_slice() -> ColPaliEngineDataset:
+    """Wrapper matching load_train_set()'s signature for YAML !ext / (): use."""
+    doc_ids = select_training_doc_ids(n_docs=1)
+    s = build_train_slice(doc_ids, max_queries=50, n_eval=5)
+    return build_colpali_train_dataset({"corpus": s["corpus"], "queries": s["queries"]})
+
+
+def load_colpali_eval_slice() -> ColPaliEngineDataset:
+    """Same idea for eval_dataset."""
+    doc_ids = select_training_doc_ids(n_docs=1)
+    s = build_train_slice(doc_ids, max_queries=50, n_eval=5)
+    return build_colpali_train_dataset({"corpus": s["corpus"], "queries": s["eval_queries"]})

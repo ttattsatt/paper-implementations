@@ -1,0 +1,47 @@
+config:
+  (): colpali_engine.trainer.colmodel_training.ColModelTrainingConfig
+  output_dir: !path ./adapter_output
+  processor:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instanciate: !ext colpali_engine.models.ColPaliProcessor
+    pretrained_model_name_or_path: "vidore/colpaligemma-3b-pt-448-base"
+    max_length: 50
+  model:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instanciate: !ext colpali_engine.models.ColPali
+    pretrained_model_name_or_path: "vidore/colpaligemma-3b-pt-448-base"
+    torch_dtype: !ext torch.bfloat16
+
+  train_dataset:
+    (): core.load_colpali_train_slice
+  eval_dataset:
+    (): core.load_colpali_eval_slice
+
+  max_length: 50
+  run_eval: true
+  loss_func:
+    (): colpali_engine.loss.late_interaction_losses.ColbertPairwiseCELoss
+  tr_args:
+    (): transformers.training_args.TrainingArguments
+    output_dir: null
+    overwrite_output_dir: true
+    num_train_epochs: 5
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 2
+    eval_strategy: "steps"
+    eval_steps: 10
+    save_steps: 999999
+    logging_steps: 1
+    warmup_steps: 5
+    learning_rate: 5e-5
+    save_total_limit: 1
+    bf16: true
+  peft_config:
+    (): peft.LoraConfig
+    r: 8
+    lora_alpha: 16
+    lora_dropout: 0.1
+    init_lora_weights: "gaussian"
+    bias: "none"
+    task_type: "FEATURE_EXTRACTION"
+    target_modules: '(.*(language_model).*(down_proj|gate_proj|up_proj|k_proj|q_proj|v_proj|o_proj).*$|.*(custom_text_proj).*$)'
