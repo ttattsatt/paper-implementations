@@ -90,13 +90,14 @@ def load_colpali_train_model() -> ColPali:
     Wrapper matching the `(): core.func` config resolution convention, used
     in place of AllPurposeWrapper for the `model:` block in train_config.yaml.
 
-    ColPali adds `custom_text_proj` (colpali_engine/models/colpali.py) as a
-    freshly-constructed nn.Linear layer inside __init__, with no
-    corresponding entry in vidore/colpaligemma-3b-pt-448-base's checkpoint
-    (it's ColPali-specific, not part of base PaliGemma). transformers
-    constructs the whole model under a meta-device context, then streams in
-    real checkpoint weights per-parameter as it finds matching keys —
-    custom_text_proj has no matching key, so it stays on meta permanently.
+    On a real T4 run, `model.lm_head.weight` was the parameter left on the
+    meta device after from_pretrained() (ColPali's _keys_to_ignore_on_load_missing
+    explicitly excludes it from checkpoint loading, since the LM head isn't
+    used for retrieval — so nothing ever streams a value into it).
+    transformers constructs the whole model under a meta-device context,
+    then streams in real checkpoint weights per-parameter as it finds
+    matching keys; any parameter with no matching key (or explicitly
+    ignored, like lm_head.weight here) stays meta permanently.
 
     Confirmed empirically (transformers 5.13.1) that low_cpu_mem_usage=False
     alone does NOT prevent this — the meta tensor is still present
@@ -105,15 +106,21 @@ def load_colpali_train_model() -> ColPali:
     that alone was sufficient, suggesting the meta-device construction
     became unconditional in more recent transformers versions.
 
-    Real fix: after loading, snapshot every correctly-loaded (non-meta)
-    parameter, call to_empty() to materialize the whole model (this wipes
-    ALL parameters to fresh uninitialized memory, not just the meta ones),
-    restore the snapshotted real weights, then re-run weight init scoped
-    to only the specific submodule that was actually meta
-    (model.custom_text_proj), leaving every pretrained weight untouched.
+    Fix: after loading, snapshot every correctly-loaded (non-meta) parameter
+    to CPU RAM, call to_empty() to materialize the whole model on the target
+    device (this wipes ALL parameters to fresh uninitialized memory, not
+    just the meta ones — confirmed directly), restore the snapshotted real
+    weights (popping each from the snapshot dict as it's restored, to avoid
+    holding two full copies of a 3B-param model in memory at once — an
+    earlier version of this function snapshotted on GPU and OOM-killed on a
+    T4), then re-run weight init scoped only to the specific submodule(s)
+    that were actually meta, leaving every pretrained weight untouched.
     Verified structurally correct on a CPU dummy model reproducing this
-    exact base-model-plus-fresh-layer pattern (own testing, not GPU-verified
-    against the real 3B checkpoint due to no local GPU access).
+    exact base-model-plus-ignored-head pattern (own testing, not fully
+    GPU-verified against the real 3B checkpoint due to no local GPU access —
+    the meta-tensor detection and materialization logic matched the real
+    run's reported "Materializing 1 meta tensor(s): ['model.lm_head.weight']"
+    exactly, but the subsequent OOM fix here is untested beyond this).
     """
     device = get_torch_device("auto")
     model = ColPali.from_pretrained(
@@ -128,27 +135,35 @@ def load_colpali_train_model() -> ColPali:
 
     print(f"Materializing {len(meta_param_names)} meta tensor(s): {meta_param_names}")
 
-    # Snapshot every correctly-loaded (non-meta) tensor before to_empty(),
-    # since to_empty() allocates fresh, uninitialized memory for ALL
-    # parameters — including ones that already had real checkpoint data.
-    real_tensors = {
-        n: p.detach().clone()
+    # model.to(device) raises NotImplementedError the instant it hits ANY
+    # meta parameter, regardless of how many others are fine — confirmed
+    # directly, this isn't a "some tensors ok, some not" partial failure.
+    # to_empty() is the only way to move a model containing meta tensors,
+    # but it wipes every parameter (not just the meta ones) to fresh
+    # uninitialized memory. Snapshotting all non-meta tensors on GPU before
+    # to_empty() briefly holds ~2x the model in GPU memory and OOM-killed
+    # on a T4 — snapshot on CPU RAM instead, and free each tensor from the
+    # snapshot the moment it's restored, keeping peak GPU memory to ~1x.
+    real_tensors_cpu = {
+        n: p.detach().to("cpu").clone()
         for n, p in model.named_parameters()
         if n not in meta_param_names
     }
 
     model = model.to_empty(device=device)
 
-    # Restore the real (correctly-loaded) weights that to_empty() just wiped.
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if name in real_tensors:
-                param.copy_(real_tensors[name].to(device))
+            if name in real_tensors_cpu:
+                param.copy_(real_tensors_cpu.pop(name).to(device))
 
-    # Only custom_text_proj (or whatever's left meta) still holds
-    # uninitialized memory at this point — re-init just that submodule,
-    # not the whole model, so pretrained weights are left untouched.
-    model.custom_text_proj.apply(model._init_weights)
+    # Only the modules that owned a meta parameter still hold uninitialized
+    # memory at this point — re-init just those, not the whole model, so
+    # pretrained weights elsewhere are left untouched.
+    touched_modules = {name.rpartition(".")[0] for name in meta_param_names}
+    for module_path in touched_modules:
+        module = model.get_submodule(module_path) if module_path else model
+        module.apply(model._init_weights)
 
     return model
 
