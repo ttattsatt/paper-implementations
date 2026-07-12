@@ -11,6 +11,7 @@ config:
     class_to_instanciate: !ext colpali_engine.models.ColPali
     pretrained_model_name_or_path: "vidore/colpaligemma-3b-pt-448-base"
     torch_dtype: !ext torch.bfloat16
+    device_map: "cuda:0"
 
   train_dataset:
     (): core.load_colpali_train_slice
@@ -24,7 +25,6 @@ config:
   tr_args:
     (): transformers.training_args.TrainingArguments
     output_dir: null
-    overwrite_output_dir: true
     num_train_epochs: 5
     per_device_train_batch_size: 2
     per_device_eval_batch_size: 2
@@ -44,4 +44,12 @@ config:
     init_lora_weights: "gaussian"
     bias: "none"
     task_type: "FEATURE_EXTRACTION"
-    target_modules: '(.*(language_model).*(down_proj|gate_proj|up_proj|k_proj|q_proj|v_proj|o_proj).*$|.*(custom_text_proj).*$)'
+    target_modules:
+      - down_proj
+      - gate_proj
+      - up_proj
+      - k_proj
+      - q_proj
+      - v_proj
+      - o_proj
+      - custom_text_proj
