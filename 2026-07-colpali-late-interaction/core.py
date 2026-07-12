@@ -65,7 +65,12 @@ def select_training_doc_ids(n_docs: int = 1) -> list[str]:
     diagram-density is measured by how often real queries were annotated as
     needing an Infographic/Chart on that page, not just page-count.
     """
-    corpus_id_to_doc_id = {row["corpus_id"]: row["doc_id"] for row in corpus}
+    # select_columns first: iterating full `corpus` rows decodes the image
+    # column per-row and hangs/stalls badly on Colab (confirmed: .filter()
+    # and row iteration over the image column can take minutes to never-finish
+    # vs <1s once the image column is dropped from the view).
+    corpus_ids_and_docs = corpus.select_columns(["corpus_id", "doc_id"])
+    corpus_id_to_doc_id = {row["corpus_id"]: row["doc_id"] for row in corpus_ids_and_docs}
 
     diagram_counts: dict[str, int] = {}
     for row in qrels:
@@ -92,7 +97,15 @@ def build_train_slice(doc_ids: list[str], max_queries: int = 50, n_eval: int = 5
     Full corpus/queries/qrels stay untouched for Phase 5 eval — this only
     returns filtered, flattened views for training.
     """
-    train_corpus = corpus.filter(lambda x: x["doc_id"] in doc_ids)
+    # Same image-decode-hang issue as select_training_doc_ids(): filter on an
+    # image-free projection to find matching row indices, then .select() those
+    # indices from the original `corpus` so the image column survives in the
+    # output without ever being decoded during the filter predicate itself.
+    corpus_ids_and_docs = corpus.select_columns(["corpus_id", "doc_id"])
+    match_indices = [
+        i for i, row in enumerate(corpus_ids_and_docs) if row["doc_id"] in doc_ids
+    ]
+    train_corpus = corpus.select(match_indices)
     train_corpus_ids = set(train_corpus["corpus_id"])
 
     relevant_qrels = qrels.filter(lambda x: x["corpus_id"] in train_corpus_ids)
@@ -130,7 +143,11 @@ def build_train_slice(doc_ids: list[str], max_queries: int = 50, n_eval: int = 5
 
 def preview_train_slice(doc_ids: list[str], out_dir: Path, n_preview: int = 8) -> None:
     """Save a handful of page images from the training doc(s) to out_dir for eyeballing."""
-    train_corpus = corpus.filter(lambda x: x["doc_id"] in doc_ids)
+    corpus_ids_and_docs = corpus.select_columns(["corpus_id", "doc_id"])
+    match_indices = [
+        i for i, row in enumerate(corpus_ids_and_docs) if row["doc_id"] in doc_ids
+    ]
+    train_corpus = corpus.select(match_indices)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     step = max(1, len(train_corpus) // n_preview)
