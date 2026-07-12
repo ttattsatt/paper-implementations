@@ -85,6 +85,72 @@ def load_colpali_train_model() -> ColPali:
 
 DIAGRAM_CONTENT_TYPES = {"Infographic", "Chart"}
 
+def load_colpali_train_model() -> ColPali:
+    """
+    Wrapper matching the `(): core.func` config resolution convention, used
+    in place of AllPurposeWrapper for the `model:` block in train_config.yaml.
+
+    ColPali adds `custom_text_proj` (colpali_engine/models/colpali.py) as a
+    freshly-constructed nn.Linear layer inside __init__, with no
+    corresponding entry in vidore/colpaligemma-3b-pt-448-base's checkpoint
+    (it's ColPali-specific, not part of base PaliGemma). transformers
+    constructs the whole model under a meta-device context, then streams in
+    real checkpoint weights per-parameter as it finds matching keys —
+    custom_text_proj has no matching key, so it stays on meta permanently.
+
+    Confirmed empirically (transformers 5.13.1) that low_cpu_mem_usage=False
+    alone does NOT prevent this — the meta tensor is still present
+    immediately after from_pretrained() returns, before any .to(device)
+    call. This contradicts older reports (e.g. GitHub issue #29423) where
+    that alone was sufficient, suggesting the meta-device construction
+    became unconditional in more recent transformers versions.
+
+    Real fix: after loading, snapshot every correctly-loaded (non-meta)
+    parameter, call to_empty() to materialize the whole model (this wipes
+    ALL parameters to fresh uninitialized memory, not just the meta ones),
+    restore the snapshotted real weights, then re-run weight init scoped
+    to only the specific submodule that was actually meta
+    (model.custom_text_proj), leaving every pretrained weight untouched.
+    Verified structurally correct on a CPU dummy model reproducing this
+    exact base-model-plus-fresh-layer pattern (own testing, not GPU-verified
+    against the real 3B checkpoint due to no local GPU access).
+    """
+    device = get_torch_device("auto")
+    model = ColPali.from_pretrained(
+        "vidore/colpaligemma-3b-pt-448-base",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=False,
+    )
+
+    meta_param_names = [n for n, p in model.named_parameters() if p.is_meta]
+    if not meta_param_names:
+        return model.to(device)
+
+    print(f"Materializing {len(meta_param_names)} meta tensor(s): {meta_param_names}")
+
+    # Snapshot every correctly-loaded (non-meta) tensor before to_empty(),
+    # since to_empty() allocates fresh, uninitialized memory for ALL
+    # parameters — including ones that already had real checkpoint data.
+    real_tensors = {
+        n: p.detach().clone()
+        for n, p in model.named_parameters()
+        if n not in meta_param_names
+    }
+
+    model = model.to_empty(device=device)
+
+    # Restore the real (correctly-loaded) weights that to_empty() just wiped.
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in real_tensors:
+                param.copy_(real_tensors[name].to(device))
+
+    # Only custom_text_proj (or whatever's left meta) still holds
+    # uninitialized memory at this point — re-init just that submodule,
+    # not the whole model, so pretrained weights are left untouched.
+    model.custom_text_proj.apply(model._init_weights)
+
+    return model
 
 def select_training_doc_ids(n_docs: int = 1) -> list[str]:
     """
