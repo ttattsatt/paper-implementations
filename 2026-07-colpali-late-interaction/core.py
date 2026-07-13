@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, cast
 from colpali_engine.data.dataset import ColPaliEngineDataset
 
-
+import math
 
 import torch
 from colpali_engine.interpretability import (
@@ -52,38 +52,6 @@ def load_model() -> tuple[ColPali, ColPaliProcessor]:
     processor = cast(ColPaliProcessor, ColPaliProcessor.from_pretrained(MODEL_NAME))
     return model, processor
 
-def load_colpali_train_model() -> ColPali:
-    """
-    Wrapper matching the `(): core.func` config resolution convention, used
-    in place of AllPurposeWrapper for the `model:` block in train_config.yaml.
-
-    ColPali adds `custom_text_proj` (colpali_engine/models/colpali.py) as a
-    freshly-constructed nn.Linear layer inside __init__, with no
-    corresponding entry in vidore/colpaligemma-3b-pt-448-base's checkpoint
-    (it's ColPali-specific, not part of base PaliGemma). This exact pattern
-    — a subclass adding a new layer in __init__ — is a known transformers
-    issue when low_cpu_mem_usage=True (the default in recent versions):
-    the new layer's parameters get constructed on the meta device and never
-    receive real data, since low_cpu_mem_usage's lazy/meta-device loading
-    path only knows how to stream in weights that exist in the checkpoint.
-    See https://github.com/huggingface/transformers/issues/29423 — a report
-    of this exact scenario, resolved by setting low_cpu_mem_usage=False.
-    Confirmed via reading transformers.modeling_utils source directly that
-    device_map and low_cpu_mem_usage constructed independently both failed
-    on their own in earlier attempts (likely because `accelerate launch`
-    forces its own device-dispatch context regardless) — if this still
-    fails, the next thing to try is loading without `accelerate launch`
-    at all (plain `python train_colbert.py`) to rule that out.
-    """
-    device = get_torch_device("auto")
-    model = ColPali.from_pretrained(
-        "vidore/colpaligemma-3b-pt-448-base",
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False,
-    ).to(device)
-    return model
-
-DIAGRAM_CONTENT_TYPES = {"Infographic", "Chart"}
 
 def load_colpali_train_model() -> ColPali:
     """
@@ -165,7 +133,23 @@ def load_colpali_train_model() -> ColPali:
         module = model.get_submodule(module_path) if module_path else model
         module.apply(model._init_weights)
 
+    
+    # Fix: embed_scale is a buffer (not a parameter), so it isn't
+    # captured by the named_parameters()-based snapshot/restore and
+    # gets left at its to_empty()-initialized value of 0.0, which
+    # zeroes out every embedding and propagates NaN through the model.
+    embed_layer = model.model.model.language_model.embed_tokens
+    embed_layer.embed_scale = torch.tensor(
+        math.sqrt(model.config.text_config.hidden_size),
+        device=model.device,
+        dtype=model.dtype,
+    )
+
     return model
+
+
+DIAGRAM_CONTENT_TYPES = {"Infographic", "Chart"}
+
 
 def select_training_doc_ids(n_docs: int = 1) -> list[str]:
     """
